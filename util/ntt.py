@@ -269,3 +269,5 @@ class FFTContext:
             gap = self.fft_length // idx_mod
             for j in range(0, num_coeffs, (1 << logm)):
                 for i in range(1 << (logm - 1)):
+                    index_even = j + i
+                    index_odd = j + i + (1 << (logm - 1))
