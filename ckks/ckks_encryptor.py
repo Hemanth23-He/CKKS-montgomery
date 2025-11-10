@@ -79,3 +79,4 @@ class CKKSEncryptor:
             new_modulus (int): New modulus.
         """
         self.coeff_modulus = new_modulus
+
