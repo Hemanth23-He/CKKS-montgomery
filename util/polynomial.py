@@ -313,10 +313,49 @@ class Polynomial:
             new_coeffs = [c - coeff_modulus if c > coeff_modulus // 2 else c for c in new_coeffs]
         return Polynomial(self.ring_degree, new_coeffs)
 
-    def base_decompose(self, base, num_levels):
-        """Decomposes each polynomial coefficient into a base T
-        representation.
+     def base_decompose(self, base, num_levels):
+        """Decomposes each polynomial coefficient into a base T representation.
         Args:
             base (int): Base to decompose coefficients with.
             num_levels (int): Log of ciphertext modulus with the specified base.
-        Returns
+        Returns:
+            An array of Polynomials, where the ith element is the coefficient of
+            the base T^i.
+        """
+        decomposed = [Polynomial(self.ring_degree, [0] * self.ring_degree) for _ in range(num_levels)]
+        poly = self
+        for i in range(num_levels):
+            decomposed[i] = poly.mod(base)
+            poly = poly.scalar_multiply(1 / base).floor()
+        return decomposed
+
+    def evaluate(self, inp):
+        """Evaluates the polynomial at the given input value.
+        Evaluates the polynomial using Horner's method.
+        Args:
+            inp (int): Value to evaluate polynomial at.
+        Returns:
+            Evaluation of polynomial at input.
+        """
+        result = self.coeffs[-1]
+        for i in range(self.ring_degree - 2, -1, -1):
+            result = result * inp + self.coeffs[i]
+        return result
+
+    def __str__(self):
+        """Represents polynomial as a readable string.
+        Returns:
+            A string which represents the Polynomial.
+        """
+        s = ''
+        for i in range(self.ring_degree - 1, -1, -1):
+            if self.coeffs[i] != 0:
+                if s != '':
+                    s += ' + '
+                if i == 0 or self.coeffs[i] != 1:
+                    s += str(int(self.coeffs[i]))
+                if i != 0:
+                    s += 'x'
+                if i > 1:
+                    s += '^' + str(i)
+        return s
