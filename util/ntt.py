@@ -39,6 +39,9 @@ class NTTContext:
         self.coeff_modulus = coeff_modulus
         self.degree = poly_degree
         if not root_of_unity:
+            # We use the (2d)-th root of unity, since d of these are roots of x^d + 1, which can be
+            # used to uniquely identify any polynomial mod x^d + 1 from the CRT representation of
+            # x^d + 1.
             root_of_unity = nbtheory.root_of_unity(order=2 * poly_degree, modulus=coeff_modulus)
         self.precompute_ntt(root_of_unity)
 
@@ -49,15 +52,18 @@ class NTTContext:
         Args:
             root_of_unity (int): Root of unity to perform the NTT with.
         """
+        # Find powers of root of unity.
         self.roots_of_unity = [1] * self.degree
         for i in range(1, self.degree):
             self.roots_of_unity[i] = \
                 (self.roots_of_unity[i - 1] * root_of_unity) % self.coeff_modulus
+        # Find powers of inverse root of unity.
         root_of_unity_inv = nbtheory.mod_inv(root_of_unity, self.coeff_modulus)
         self.roots_of_unity_inv = [1] * self.degree
         for i in range(1, self.degree):
             self.roots_of_unity_inv[i] = \
                 (self.roots_of_unity_inv[i - 1] * root_of_unity_inv) % self.coeff_modulus
+        # Compute precomputed array of reversed bits for iterated NTT.
         self.reversed_bits = [0] * self.degree
         width = int(log(self.degree, 2))
         for i in range(self.degree):
@@ -88,6 +94,7 @@ class NTTContext:
                     index_odd = j + i + (1 << (logm - 1))
                     rou_idx = (i << (1 + log_num_coeffs - logm))
                     omega = rou[rou_idx]
+                    # Montgomery multiply for omega * result[index_odd]
                     omega_mont = reducer.to_montgomery(omega)
                     odd_mont = reducer.to_montgomery(result[index_odd])
                     omega_factor = reducer.montgomery_mul(omega_mont, odd_mont)
@@ -110,10 +117,14 @@ class NTTContext:
         num_coeffs = len(coeffs)
         assert num_coeffs == self.degree, "ftt_fwd: input length does not match context degree"
         reducer = MontgomeryReducer(self.coeff_modulus)
-        ftt_input = [reducer.montgomery_mul(reducer.to_montgomery(int(coeffs[i])), 
-                                            reducer.to_montgomery(self.roots_of_unity[i]))
-                     for i in range(num_coeffs)]
-        ftt_input = [reducer.from_montgomery(x) for x in ftt_input]
+        # We use the FTT input given in the FTT paper.
+        ftt_input = []
+        for i in range(num_coeffs):
+            coeff_mont = reducer.to_montgomery(int(coeffs[i]))
+            root_mont = reducer.to_montgomery(self.roots_of_unity[i])
+            prod_mont = reducer.montgomery_mul(coeff_mont, root_mont)
+            prod = reducer.from_montgomery(prod_mont)
+            ftt_input.append(prod % self.coeff_modulus)
         return self.ntt(coeffs=ftt_input, rou=self.roots_of_unity)
 
     def ftt_inv(self, coeffs):
@@ -130,16 +141,16 @@ class NTTContext:
         reducer = MontgomeryReducer(self.coeff_modulus)
         to_scale_down = self.ntt(coeffs=coeffs, rou=self.roots_of_unity_inv)
         poly_degree_inv = nbtheory.mod_inv(self.degree, self.coeff_modulus)
-        result = [
-            reducer.montgomery_mul(
-                reducer.montgomery_mul(
-                    reducer.to_montgomery(int(to_scale_down[i])),
-                    reducer.to_montgomery(self.roots_of_unity_inv[i])
-                ),
-                reducer.to_montgomery(poly_degree_inv)
-            ) % self.coeff_modulus for i in range(num_coeffs)
-        ]
-        result = [reducer.from_montgomery(x) for x in result]
+        # We scale down the FTT output given in the FTT paper.
+        result = []
+        for i in range(num_coeffs):
+            val_mont = reducer.to_montgomery(int(to_scale_down[i]))
+            root_inv_mont = reducer.to_montgomery(self.roots_of_unity_inv[i])
+            prod1_mont = reducer.montgomery_mul(val_mont, root_inv_mont)
+            degree_inv_mont = reducer.to_montgomery(poly_degree_inv)
+            prod2_mont = reducer.montgomery_mul(prod1_mont, degree_inv_mont)
+            final = reducer.from_montgomery(prod2_mont)
+            result.append(final % self.coeff_modulus)
         return result
 
 
@@ -175,11 +186,13 @@ class FFTContext:
             angle = 2 * pi * i / self.fft_length
             self.roots_of_unity[i] = complex(cos(angle), sin(angle))
             self.roots_of_unity_inv[i] = complex(cos(-angle), sin(-angle))
+        # Compute precomputed array of reversed bits for iterated FFT.
         num_slots = self.fft_length // 4
         self.reversed_bits = [0] * num_slots
         width = int(log(num_slots, 2))
         for i in range(num_slots):
             self.reversed_bits[i] = reverse_bits(i, width) % num_slots
+        # Compute rotation group for EMB with powers of 5.
         self.rot_group = [1] * num_slots
         for i in range(1, num_slots):
             self.rot_group[i] = (5 * self.rot_group[i - 1]) % self.fft_length
@@ -254,20 +267,4 @@ class FFTContext:
         that are indexed 1 (mod 4), w, w^5, w^9, ...
         The evaluations are returned in the order: w, w^5, w^(5^2), ...
         Args:
-            coeffs (list): List of complex numbers to transform.
-        Returns:
-            List of transformed coefficients.
-        """
-        self.check_embedding_input(coeffs)
-        num_coeffs = len(coeffs)
-        result = bit_reverse_vec(coeffs)
-        log_num_coeffs = int(log(num_coeffs, 2))
-        for logm in range(1, log_num_coeffs + 1):
-            idx_mod = 1 << (logm + 2)
-            gap = self.fft_length // idx_mod
-            for j in range(0, num_coeffs, (1 << logm)):
-                for i in range(1 << (logm - 1)):
-                    index_even = j + i
-                    index_odd = j + i + (1 << (logm - 1))
-                    rou_idx = (self.rot_group[i] % idx_mod) * gap
-                    omega_factor = self.roots_of_unity[rou_idx] * result[index_od]
+            coeffs (list
