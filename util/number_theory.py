@@ -13,7 +13,6 @@ def mod_exp(val, exp, modulus):
     Returns:
         A value raised to a power in a modulus.
     """
-    # Use Montgomery reduction for big exponentiation
     reducer = MontgomeryReducer(modulus)
     val_mont = reducer.to_montgomery(int(val))
     result = reducer.to_montgomery(1)
@@ -23,7 +22,6 @@ def mod_exp(val, exp, modulus):
             result = reducer.montgomery_mul(result, val_mont)
         val_mont = reducer.montgomery_mul(val_mont, val_mont)
         exp //= 2
-    # Convert result out of Montgomery form
     return reducer.from_montgomery(result)
 
 def mod_inv(val, modulus):
@@ -89,11 +87,12 @@ def is_prime(number, num_trials=200):
     for _ in range(num_trials):
         rand_val = int(random.SystemRandom().randrange(1, number))
         new_exp = exp
-        # Use Montgomery reduction for modular multiplication
         reducer = MontgomeryReducer(number)
         power = mod_exp(rand_val, new_exp, number)
         while new_exp != number - 1 and power != 1 and power != number - 1:
-            power = reducer.montgomery_mul(power, power)
+            power_mont = reducer.to_montgomery(power)
+            power_squared_mont = reducer.montgomery_mul(power_mont, power_mont)
+            power = reducer.from_montgomery(power_squared_mont)
             power = power % number
             new_exp *= 2
         if power != number - 1 and new_exp % 2 == 0:
