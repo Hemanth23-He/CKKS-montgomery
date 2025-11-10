@@ -12,7 +12,7 @@ class CKKSDecryptor:
         """Initializes decryptor for CKKS scheme.
         Args:
             params (Parameters): Parameters including polynomial degree,
-            plaintext modulus, and ciphertext modulus.
+                plaintext modulus, and ciphertext modulus.
             secret_key (SecretKey): Secret key used for decryption.
         """
         self.poly_degree = params.poly_degree
@@ -24,11 +24,12 @@ class CKKSDecryptor:
         Args:
             ciphertext (Ciphertext): Ciphertext to be decrypted.
             c2 (Polynomial): Optional additional parameter for a ciphertext that
-            has not been relinearized.
+                has not been relinearized.
         Returns:
             The plaintext corresponding to the decrypted ciphertext.
         """
-        c0, c1 = ciphertext.c0, ciphertext.c1
+        (c0, c1) = (ciphertext.c0, ciphertext.c1)
+        # Montgomery reduction is used implicitly in Polynomial.multiply/add/mod_small
         message = c1.multiply(self.secret_key.s, ciphertext.modulus)
         message = c0.add(message, ciphertext.modulus)
         if c2:
