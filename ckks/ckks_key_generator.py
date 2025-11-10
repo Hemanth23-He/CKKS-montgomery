@@ -1,125 +1,81 @@
-"""A module to generate public and private keys for the CKKS scheme."""
+"""A module to encrypt for the CKKS scheme."""
 
+from util.ciphertext import Ciphertext
 from util.polynomial import Polynomial
-from util.public_key import PublicKey
-from util.rotation_key import RotationKey
-from util.secret_key import SecretKey
-from util.random_sample import sample_triangle, sample_uniform, sample_hamming_weight_vector
+from util.random_sample import sample_triangle
 
-class CKKSKeyGenerator:
-
-    """An instance to generate a public/secret key pair and relinearization keys.
-
-    The secret key s is generated randomly, and the public key is the
-    pair (-as + e, a). The relinearization keys are generated, as
-    specified in the CKKS paper.
-
+class CKKSEncryptor:
+    """An object that can encrypt data using CKKS given a public key.
     Attributes:
-        params (Parameters): Parameters including polynomial degree, plaintext,
-            and ciphertext modulus.
-        secret_key (Polynomial): secret key randomly generated from R_q.
-        public_key (tuple of Polynomials): public key generated from
-            secret key.
-        relin_key (tuple of Polynomials): relinearization key generated
-            from secret key.
+        poly_degree: Degree of polynomial in quotient ring.
+        coeff_modulus: Coefficient modulus in ciphertext space.
+        big_modulus: Bootstrapping modulus.
+        public_key (PublicKey): Public key used for encryption.
+        secret_key (SecretKey): Only used for secret key encryption.
     """
-
-    def __init__(self, params):
-        """Generates secret/public key pair for CKKS scheme.
-
+    def __init__(self, params, public_key, secret_key=None):
+        """Generates private/public key pair for CKKS scheme.
         Args:
             params (Parameters): Parameters including polynomial degree,
-                plaintext, and ciphertext modulus.
+                ciphertext modulus, etc.
+            public_key (PublicKey): Public key used for encryption.
+            secret_key (SecretKey): Optionally passed for secret key encryption.
         """
-        self.params = params
-        self.generate_secret_key(params)
-        self.generate_public_key(params)
-        self.generate_relin_key(params)
+        self.poly_degree = params.poly_degree
+        self.coeff_modulus = params.ciph_modulus
+        self.big_modulus = params.big_modulus
+        self.public_key = public_key
+        self.secret_key = secret_key
 
-    def generate_secret_key(self, params):
-        """Generates a secret key for CKKS scheme.
-
+    def encrypt_with_secret_key(self, plain):
+        """Encrypts a message with secret key encryption.
+        Encrypts the message for secret key encryption and returns the corresponding ciphertext.
         Args:
-            params (Parameters): Parameters including polynomial degree,
-                plaintext, and ciphertext modulus.
-        """
-        key = sample_hamming_weight_vector(params.poly_degree, params.hamming_weight)
-        self.secret_key = SecretKey(Polynomial(params.poly_degree, key))
-
-    def generate_public_key(self, params):
-        """Generates a public key for CKKS scheme.
-
-        Args:
-            params (Parameters): Parameters including polynomial degree,
-                plaintext, and ciphertext modulus.
-        """
-        mod = self.params.big_modulus
-
-        pk_coeff = Polynomial(params.poly_degree, sample_uniform(0, mod, params.poly_degree))
-        pk_error = Polynomial(params.poly_degree, sample_triangle(params.poly_degree))
-        p0 = pk_coeff.multiply(self.secret_key.s, mod)
-        p0 = p0.scalar_multiply(-1, mod)
-        p0 = p0.add(pk_error, mod)
-        p1 = pk_coeff
-        self.public_key = PublicKey(p0, p1)
-
-    def generate_switching_key(self, new_key):
-        """Generates a switching key for CKKS scheme.
-
-        Generates a switching key as described in KSGen in the CKKS paper.
-
-        Args:
-            new_key (Polynomial): New key to generate switching key.
-
+            plain (Plaintext): Plaintext to be encrypted.
         Returns:
-            A switching key.
+            A ciphertext consisting of a pair of polynomials in the ciphertext space.
         """
-        mod = self.params.big_modulus
-        mod_squared = mod ** 2
+        assert self.secret_key is not None, 'Secret key does not exist'
+        sk = self.secret_key.s
+        random_vec = Polynomial(self.poly_degree, sample_triangle(self.poly_degree))
+        error = Polynomial(self.poly_degree, sample_triangle(self.poly_degree))
+        # All Polynomial math now uses MontgomeryReducer internally.
+        c0 = sk.multiply(random_vec, self.coeff_modulus)
+        c0 = error.add(c0, self.coeff_modulus)
+        c0 = c0.add(plain.poly, self.coeff_modulus)
+        c0 = c0.mod_small(self.coeff_modulus)
+        c1 = random_vec.scalar_multiply(-1, self.coeff_modulus)
+        c1 = c1.mod_small(self.coeff_modulus)
+        return Ciphertext(c0, c1, plain.scaling_factor, self.coeff_modulus)
 
-        swk_coeff = Polynomial(self.params.poly_degree, sample_uniform(0, mod_squared, self.params.poly_degree))
-        swk_error = Polynomial(self.params.poly_degree, sample_triangle(self.params.poly_degree))
-
-        sw0 = swk_coeff.multiply(self.secret_key.s, mod_squared)
-        sw0 = sw0.scalar_multiply(-1, mod_squared)
-        sw0 = sw0.add(swk_error, mod_squared)
-        temp = new_key.scalar_multiply(mod, mod_squared)
-        sw0 = sw0.add(temp, mod_squared)
-        sw1 = swk_coeff
-        return PublicKey(sw0, sw1)
-
-    def generate_relin_key(self, params):
-        """Generates a relinearization key for CKKS scheme.
-
+    def encrypt(self, plain):
+        """Encrypts a message.
+        Encrypts the message and returns the corresponding ciphertext.
         Args:
-            params (Parameters): Parameters including polynomial degree,
-                plaintext, and ciphertext modulus.
+            plain (Plaintext): Plaintext to be encrypted.
+        Returns:
+            A ciphertext consisting of a pair of polynomials in the ciphertext space.
         """
-        sk_squared = self.secret_key.s.multiply(self.secret_key.s, self.params.big_modulus)
-        self.relin_key = self.generate_switching_key(sk_squared)
+        p0 = self.public_key.p0
+        p1 = self.public_key.p1
 
-    def generate_rot_key(self, rotation):
-        """Generates a rotation key for CKKS scheme.
+        random_vec = Polynomial(self.poly_degree, sample_triangle(self.poly_degree))
+        error1 = Polynomial(self.poly_degree, sample_triangle(self.poly_degree))
+        error2 = Polynomial(self.poly_degree, sample_triangle(self.poly_degree))
+        # All Polynomial math now uses MontgomeryReducer internally.
+        c0 = p0.multiply(random_vec, self.coeff_modulus)
+        c0 = error1.add(c0, self.coeff_modulus)
+        c0 = c0.add(plain.poly, self.coeff_modulus)
+        c0 = c0.mod_small(self.coeff_modulus)
+        c1 = p1.multiply(random_vec, self.coeff_modulus)
+        c1 = error2.add(c1, self.coeff_modulus)
+        c1 = c1.mod_small(self.coeff_modulus)
+        return Ciphertext(c0, c1, plain.scaling_factor, self.coeff_modulus)
 
+    def raise_modulus(self, new_modulus):
+        """Rescales scheme to have a new modulus.
+        Raises ciphertext modulus.
         Args:
-            rotation (int): Amount ciphertext is to be rotated by.
-
-        Returns:
-            A rotation key.
+            new_modulus (int): New modulus.
         """
-
-        # Generate K_5^r(s).
-        new_key = self.secret_key.s.rotate(rotation)
-        rk = self.generate_switching_key(new_key)
-        return RotationKey(rotation, rk)
-
-    def generate_conj_key(self):
-        """Generates a conjugation key for CKKS scheme.
-
-        Returns:
-            A conjugation key.
-        """
-
-        # Generate K_{-1}(s).
-        new_key = self.secret_key.s.conjugate()
-        return self.generate_switching_key(new_key)
+        self.coeff_modulus = new_modulus
