@@ -270,4 +270,4 @@ class FFTContext:
                     index_even = j + i
                     index_odd = j + i + (1 << (logm - 1))
                     rou_idx = (self.rot_group[i] % idx_mod) * gap
-                    omega_factor = self.roots_of_unity[rou_idx] * result[index_od
+                    omega_factor = self.roots_of_unity[rou_idx] * result[index_od]
