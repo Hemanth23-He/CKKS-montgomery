@@ -313,7 +313,7 @@ class Polynomial:
             new_coeffs = [c - coeff_modulus if c > coeff_modulus // 2 else c for c in new_coeffs]
         return Polynomial(self.ring_degree, new_coeffs)
 
-     def base_decompose(self, base, num_levels):
+    def base_decompose(self, base, num_levels):
         """Decomposes each polynomial coefficient into a base T representation.
         Args:
             base (int): Base to decompose coefficients with.
