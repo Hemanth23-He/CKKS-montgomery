@@ -20,5 +20,21 @@ class MontgomeryReducer:
         u = (t + m * self.modulus) >> self.r_bits
         if u >= self.modulus:
             u -= self.modulus
+    def _mod_inverse(self, a, m):
+    """Efficiently finds the modular inverse of a mod m using the Extended Euclidean algorithm."""
+    # Ensure a and m are coprime
+    g, x, y = self._extended_gcd(a, m)
+    if g != 1:
+        raise ValueError(f"No modular inverse for {a} mod {m}")
+    return x % m
+
+    def _extended_gcd(self, a, b):
+    """Returns (g, x, y) such that a*x + b*y = g = gcd(a, b)"""
+      if a == 0:
+          return (b, 0, 1)
+       else:
+          g, y, x = self._extended_gcd(b % a, a)
+          return (g, x - (b // a) * y, y)
+
         return u
 
