@@ -1,260 +1,273 @@
-"""Optimized NTT implementation with Harvey's lazy reduction and cached twiddle factors.
-
-This module implements Harvey's NTT algorithm with:
-1. Lazy modular reduction (defer reduction until necessary)
-2. Cached and bit-reversed twiddle factors
-3. In-place butterfly operations
-4. Optimized memory access patterns
-
-Expected speedup: 2-3x over standard NTT
+"""A module to multiply polynomials using the Fast Fourier Transform (FFT), Number Theoretic Transform (NTT),
+and Fermat Theoretic Transform (FTT). See https://rijndael.ece.vt.edu/schaum/pdf/papers/2013hostb.pdf.
 """
-
-from math import log2
+from math import log, pi, cos, sin
 import util.number_theory as nbtheory
-from util.bit_operations import reverse_bits
+from util.bit_operations import bit_reverse_vec, reverse_bits
+from util.montgomery import MontgomeryReducer
 
-
-class HarveyNTTContext:
-    """Optimized NTT context using Harvey's algorithm with lazy reduction.
-    
+class NTTContext:
+    """An instance of Number/Fermat Theoretic Transform parameters.
+    Here, R is the quotient ring Z_a[x]/f(x), where f(x) = x^d + 1.
+    The NTTContext keeps track of the ring degree d, the coefficient
+    modulus a, a root of unity w so that w^2d = 1 (mod a), and
+    precomputations to perform the NTT/FTT and the inverse NTT/FTT.
     Attributes:
-        coeff_modulus (int): Modulus for coefficients.
-        degree (int): Polynomial degree (must be power of 2).
-        roots_of_unity (list): Cached forward twiddle factors.
-        roots_of_unity_inv (list): Cached inverse twiddle factors.
-        bit_reversed_rou (list): Bit-reversed twiddle factors for forward NTT.
-        bit_reversed_rou_inv (list): Bit-reversed twiddle factors for inverse NTT.
-        lazy_reduction_threshold (int): Threshold for lazy reduction (2 * modulus).
-        inv_degree (int): Modular inverse of degree for INTT.
+        coeff_modulus (int): Modulus for coefficients of the polynomial.
+        degree (int): Degree of the polynomial ring.
+        roots_of_unity (list): The ith member of the list is w^i, where w
+            is a root of unity.
+        roots_of_unity_inv (list): The ith member of the list is w^(-i),
+            where w is a root of unity.
+        scaled_rou_inv (list): The ith member of the list is 1/n * w^(-i),
+            where w is a root of unity.
+        reversed_bits (list): The ith member of the list is the bits of i
+            reversed, used in the iterative implementation of NTT.
     """
-    
     def __init__(self, poly_degree, coeff_modulus, root_of_unity=None):
-        """Initialize Harvey NTT context with optimized precomputations.
-        
+        """Inits NTTContext with a coefficient modulus for the polynomial ring
+        Z[x]/f(x) where f has the given poly_degree.
         Args:
-            poly_degree (int): Degree of polynomial (must be power of 2).
-            coeff_modulus (int): Coefficient modulus.
-            root_of_unity (int, optional): Custom root of unity.
+            poly_degree (int): Degree of the polynomial ring.
+            coeff_modulus (int): Modulus for coefficients of the polynomial.
+            root_of_unity (int): Root of unity to perform the NTT with. If it
+                takes its default value of None, we compute a root of unity to
+                use.
         """
         assert (poly_degree & (poly_degree - 1)) == 0, \
-            f"Polynomial degree must be power of 2, got {poly_degree}"
-        
+            "Polynomial degree must be a power of 2. d = " + str(poly_degree) + " is not."
         self.coeff_modulus = coeff_modulus
         self.degree = poly_degree
-        self.log_degree = int(log2(poly_degree))
-        
-        # Lazy reduction threshold: allow coefficients up to 2*q
-        self.lazy_reduction_threshold = 2 * coeff_modulus
-        
-        # Find root of unity
         if not root_of_unity:
-            root_of_unity = nbtheory.root_of_unity(
-                order=2 * poly_degree, 
-                modulus=coeff_modulus
-            )
-        
-        # Precompute and cache twiddle factors
-        self._precompute_twiddle_factors(root_of_unity)
-        
-        # Precompute inverse degree for INTT
-        self.inv_degree = nbtheory.mod_inv(self.degree, self.coeff_modulus)
-    
-    def _precompute_twiddle_factors(self, root_of_unity):
-        """Precompute and bit-reverse twiddle factors for optimized NTT.
-        
-        This is done ONCE during initialization, avoiding repeated
-        bit-reversal operations during NTT calls.
-        
+            root_of_unity = nbtheory.root_of_unity(order=2 * poly_degree, modulus=coeff_modulus)
+        self.precompute_ntt(root_of_unity)
+
+    def precompute_ntt(self, root_of_unity):
+        """Performs precomputations for the NTT and inverse NTT.
+        Precomputes all powers of roots of unity for the NTT and scaled powers of inverse
+        roots of unity for the inverse NTT.
         Args:
-            root_of_unity (int): Primitive (2N)-th root of unity.
+            root_of_unity (int): Root of unity to perform the NTT with.
         """
-        # Compute forward roots of unity
         self.roots_of_unity = [1] * self.degree
         for i in range(1, self.degree):
-            self.roots_of_unity[i] = (
-                self.roots_of_unity[i - 1] * root_of_unity
-            ) % self.coeff_modulus
-        
-        # Compute inverse roots of unity
+            self.roots_of_unity[i] = \
+                (self.roots_of_unity[i - 1] * root_of_unity) % self.coeff_modulus
         root_of_unity_inv = nbtheory.mod_inv(root_of_unity, self.coeff_modulus)
         self.roots_of_unity_inv = [1] * self.degree
         for i in range(1, self.degree):
-            self.roots_of_unity_inv[i] = (
-                self.roots_of_unity_inv[i - 1] * root_of_unity_inv
-            ) % self.coeff_modulus
-        
-        # **KEY OPTIMIZATION**: Bit-reverse twiddle factors ONCE
-        # This eliminates bit-reversal overhead in each NTT call
-        self.bit_reversed_rou = self._bit_reverse_twiddles(self.roots_of_unity)
-        self.bit_reversed_rou_inv = self._bit_reverse_twiddles(self.roots_of_unity_inv)
-    
-    def _bit_reverse_twiddles(self, twiddles):
-        """Bit-reverse twiddle factors for in-order NTT access.
-        
-        Args:
-            twiddles (list): Original twiddle factors.
-            
-        Returns:
-            list: Bit-reversed twiddle factors.
-        """
-        bit_reversed = [0] * self.degree
+            self.roots_of_unity_inv[i] = \
+                (self.roots_of_unity_inv[i - 1] * root_of_unity_inv) % self.coeff_modulus
+        self.reversed_bits = [0] * self.degree
+        width = int(log(self.degree, 2))
         for i in range(self.degree):
-            rev_i = reverse_bits(i, self.log_degree) % self.degree
-            bit_reversed[i] = twiddles[rev_i]
-        return bit_reversed
-    
-    def _lazy_reduce(self, value):
-        """Perform lazy modular reduction only when necessary.
-        
-        Harvey's key insight: Only reduce when value > 2q, not after every operation.
-        This cuts modular reductions by ~50%.
-        
+            self.reversed_bits[i] = reverse_bits(i, width) % self.degree
+
+    def ntt(self, coeffs, rou):
+        """Runs NTT on the given coefficients.
+        Runs iterated NTT with the given coefficients and roots of unity. See
+        paper for pseudocode.
         Args:
-            value (int): Value to potentially reduce.
-            
+            coeffs (list): List of coefficients to transform. Must be the
+                length of the polynomial degree.
+            rou (list): Powers of roots of unity to be used for transformation.
+                For inverse NTT, this is the powers of the inverse root of unity.
         Returns:
-            int: Reduced value (if needed).
+            List of transformed coefficients.
         """
-        if value >= self.lazy_reduction_threshold:
-            return value % self.coeff_modulus
-        elif value < 0:
-            # Handle negative values
-            return value % self.coeff_modulus
-        return value
-    
-    def _butterfly_lazy(self, a, b, twiddle):
-        """Optimized Cooley-Tukey butterfly with lazy reduction.
-        
-        Computes:
-            a' = a + b * twiddle  (mod q, lazy)
-            b' = a - b * twiddle  (mod q, lazy)
-        
-        Args:
-            a (int): First input.
-            b (int): Second input.
-            twiddle (int): Twiddle factor.
-            
-        Returns:
-            tuple: (a', b') with lazy reduction.
-        """
-        # Compute b * twiddle with lazy reduction
-        temp = (b * twiddle) % self.coeff_modulus
-        
-        # Butterfly operations with lazy reduction
-        a_new = self._lazy_reduce(a + temp)
-        b_new = self._lazy_reduce(a - temp)
-        
-        return a_new, b_new
-    
+        num_coeffs = len(coeffs)
+        assert len(rou) == num_coeffs, \
+            "Length of the roots of unity is too small. Length is {}".format(len(rou))
+        reducer = MontgomeryReducer(self.coeff_modulus)
+        result = bit_reverse_vec(coeffs)
+        log_num_coeffs = int(log(num_coeffs, 2))
+        for logm in range(1, log_num_coeffs + 1):
+            for j in range(0, num_coeffs, (1 << logm)):
+                for i in range(1 << (logm - 1)):
+                    index_even = j + i
+                    index_odd = j + i + (1 << (logm - 1))
+                    rou_idx = (i << (1 + log_num_coeffs - logm))
+                    omega = rou[rou_idx]
+                    omega_mont = reducer.to_montgomery(omega)
+                    odd_mont = reducer.to_montgomery(result[index_odd])
+                    omega_factor = reducer.montgomery_mul(omega_mont, odd_mont)
+                    omega_factor = reducer.from_montgomery(omega_factor)
+                    butterfly_plus = (result[index_even] + omega_factor) % self.coeff_modulus
+                    butterfly_minus = (result[index_even] - omega_factor) % self.coeff_modulus
+                    result[index_even] = butterfly_plus
+                    result[index_odd] = butterfly_minus
+        return result
+
     def ftt_fwd(self, coeffs):
-        """Forward NTT with Harvey's optimizations.
-        
-        Uses:
-        1. Cached bit-reversed twiddle factors (no runtime bit-reversal)
-        2. Lazy reduction (defer modulo until threshold)
-        3. In-place operations where possible
-        
+        """Runs forward FTT on the given coefficients.
+        Runs forward FTT with the given coefficients and parameters in the context.
         Args:
-            coeffs (list): Input coefficients (length = degree).
-            
+            coeffs (list): List of coefficients to transform. Must be the
+                length of the polynomial degree.
         Returns:
-            list: NTT-transformed coefficients.
+            List of transformed coefficients.
         """
-        assert len(coeffs) == self.degree, \
-            f"Input length {len(coeffs)} != degree {self.degree}"
-        
-        # Bit-reverse input (only once at the beginning)
-        result = [0] * self.degree
-        for i in range(self.degree):
-            rev_i = reverse_bits(i, self.log_degree) % self.degree
-            result[rev_i] = coeffs[i]
-        
-        # Decimation-in-frequency (DIF) NTT with lazy reduction
-        m = 1
-        for stage in range(self.log_degree):
-            # m = 2^(stage)
-            # For each m-point butterfly group
-            for start in range(0, self.degree, 2 * m):
-                # Twiddle factor stride
-                k = 0
-                for j in range(m):
-                    idx_even = start + j
-                    idx_odd = start + j + m
-                    
-                    # Get cached twiddle factor (no bit-reversal needed!)
-                    twiddle_idx = k
-                    twiddle = self.bit_reversed_rou[twiddle_idx]
-                    
-                    # Optimized butterfly with lazy reduction
-                    result[idx_even], result[idx_odd] = self._butterfly_lazy(
-                        result[idx_even], 
-                        result[idx_odd], 
-                        twiddle
-                    )
-                    
-                    k += (self.degree // (2 * m))
-            
-            m *= 2
-        
-        # Final reduction to ensure output is in [0, q)
-        return [x % self.coeff_modulus for x in result]
-    
+        num_coeffs = len(coeffs)
+        assert num_coeffs == self.degree, "ftt_fwd: input length does not match context degree"
+        reducer = MontgomeryReducer(self.coeff_modulus)
+        ftt_input = []
+        for i in range(num_coeffs):
+            coeff_mont = reducer.to_montgomery(int(coeffs[i]))
+            root_mont = reducer.to_montgomery(self.roots_of_unity[i])
+            prod_mont = reducer.montgomery_mul(coeff_mont, root_mont)
+            prod = reducer.from_montgomery(prod_mont)
+            ftt_input.append(prod % self.coeff_modulus)
+        return self.ntt(coeffs=ftt_input, rou=self.roots_of_unity)
+
     def ftt_inv(self, coeffs):
-        """Inverse NTT with Harvey's optimizations.
-        
+        """Runs inverse FTT on the given coefficients.
+        Runs inverse FTT with the given coefficients and parameters in the context.
         Args:
-            coeffs (list): NTT-domain coefficients.
-            
+            coeffs (list): List of coefficients to transform. Must be the
+                length of the polynomial degree.
         Returns:
-            list: Time-domain coefficients.
+            List of inversely transformed coefficients.
         """
-        assert len(coeffs) == self.degree, \
-            f"Input length {len(coeffs)} != degree {self.degree}"
-        
-        # Bit-reverse input
-        result = [0] * self.degree
-        for i in range(self.degree):
-            rev_i = reverse_bits(i, self.log_degree) % self.degree
-            result[rev_i] = coeffs[i]
-        
-        # Inverse NTT with lazy reduction
-        m = 1
-        for stage in range(self.log_degree):
-            for start in range(0, self.degree, 2 * m):
-                k = 0
-                for j in range(m):
-                    idx_even = start + j
-                    idx_odd = start + j + m
-                    
-                    # Use inverse twiddle factors
-                    twiddle_idx = k
-                    twiddle = self.bit_reversed_rou_inv[twiddle_idx]
-                    
-                    # Butterfly with lazy reduction
-                    result[idx_even], result[idx_odd] = self._butterfly_lazy(
-                        result[idx_even],
-                        result[idx_odd],
-                        twiddle
-                    )
-                    
-                    k += (self.degree // (2 * m))
-            
-            m *= 2
-        
-        # Scale by 1/N and final reduction
-        return [(x * self.inv_degree) % self.coeff_modulus for x in result]
+        num_coeffs = len(coeffs)
+        assert num_coeffs == self.degree, "ntt_inv: input length does not match context degree"
+        reducer = MontgomeryReducer(self.coeff_modulus)
+        to_scale_down = self.ntt(coeffs=coeffs, rou=self.roots_of_unity_inv)
+        poly_degree_inv = nbtheory.mod_inv(self.degree, self.coeff_modulus)
+        result = []
+        for i in range(num_coeffs):
+            val_mont = reducer.to_montgomery(int(to_scale_down[i]))
+            root_inv_mont = reducer.to_montgomery(self.roots_of_unity_inv[i])
+            prod1_mont = reducer.montgomery_mul(val_mont, root_inv_mont)
+            degree_inv_mont = reducer.to_montgomery(poly_degree_inv)
+            prod2_mont = reducer.montgomery_mul(prod1_mont, degree_inv_mont)
+            final = reducer.from_montgomery(prod2_mont)
+            result.append(final % self.coeff_modulus)
+        return result
 
 
-def migrate_to_harvey_ntt(old_ntt_context):
-    """Helper function to migrate from old NTT to Harvey NTT.
-    
-    Args:
-        old_ntt_context: Existing NTTContext instance.
-        
-    Returns:
-        HarveyNTTContext: Optimized context with same parameters.
+class FFTContext:
+    """An instance of Fast Fourier Transform (FFT) parameters.
+    The FFTContext keeps track of the length of the vector and precomputations
+    to perform FFT.
+    Attributes:
+        fft_length (int): Length of the FFT vector. This must be twice the polynomial degree.
+        roots_of_unity (list): The ith member of the list is w^i, where w
+            is a root of unity.
+        rot_group (list): Used for EMB only. Value at index i is 5i (mod fft_length)
+            for 0 <= i < fft_length / 4.
+        reversed_bits (list): The ith member of the list is the bits of i
+            reversed, used in the iterative implementation of FFT.
     """
-    return HarveyNTTContext(
-        poly_degree=old_ntt_context.degree,
-        coeff_modulus=old_ntt_context.coeff_modulus
-    )
+    def __init__(self, fft_length):
+        """Inits FFTContext with a length for the FFT vector.
+        Args:
+            fft_length (int): Length of the FFT vector.
+        """
+        self.fft_length = fft_length
+        self.precompute_fft()
+
+    def precompute_fft(self):
+        """Performs precomputations for the FFT.
+        Precomputes all powers of roots of unity for the FFT and powers of inverse
+        roots of unity for the inverse FFT.
+        """
+        self.roots_of_unity = [0] * self.fft_length
+        self.roots_of_unity_inv = [0] * self.fft_length
+        for i in range(self.fft_length):
+            angle = 2 * pi * i / self.fft_length
+            self.roots_of_unity[i] = complex(cos(angle), sin(angle))
+            self.roots_of_unity_inv[i] = complex(cos(-angle), sin(-angle))
+        num_slots = self.fft_length // 4
+        self.reversed_bits = [0] * num_slots
+        width = int(log(num_slots, 2))
+        for i in range(num_slots):
+            self.reversed_bits[i] = reverse_bits(i, width) % num_slots
+        self.rot_group = [1] * num_slots
+        for i in range(1, num_slots):
+            self.rot_group[i] = (5 * self.rot_group[i - 1]) % self.fft_length
+
+    def fft(self, coeffs, rou):
+        """Runs FFT on the given coefficients.
+        Runs iterated FFT with the given coefficients and roots of unity. See
+        paper for pseudocode.
+        Args:
+            coeffs (list): List of coefficients to transform. Must be the
+                length of the polynomial degree.
+            rou (list): Powers of roots of unity to be used for transformation.
+                For inverse NTT, this is the powers of the inverse root of unity.
+        Returns:
+            List of transformed coefficients.
+        """
+        num_coeffs = len(coeffs)
+        assert len(rou) >= num_coeffs, \
+            "Length of the roots of unity is too small. Length is " + str(len(rou))
+        result = bit_reverse_vec(coeffs)
+        log_num_coeffs = int(log(num_coeffs, 2))
+        for logm in range(1, log_num_coeffs + 1):
+            for j in range(0, num_coeffs, (1 << logm)):
+                for i in range(1 << (logm - 1)):
+                    index_even = j + i
+                    index_odd = j + i + (1 << (logm - 1))
+                    rou_idx = (i * self.fft_length) >> logm
+                    omega_factor = rou[rou_idx] * result[index_odd]
+                    butterfly_plus = result[index_even] + omega_factor
+                    butterfly_minus = result[index_even] - omega_factor
+                    result[index_even] = butterfly_plus
+                    result[index_odd] = butterfly_minus
+        return result
+
+    def fft_fwd(self, coeffs):
+        """Runs forward FFT on the given values.
+        Runs forward FFT with the given values and parameters in the context.
+        Args:
+            coeffs (list): List of complex numbers to transform.
+        Returns:
+            List of transformed coefficients.
+        """
+        return self.fft(coeffs, rou=self.roots_of_unity)
+
+    def fft_inv(self, coeffs):
+        """Runs inverse FFT on the given values.
+        Runs inverse FFT with the given values and parameters in the context.
+        Args:
+            coeffs (list): List of complex numbers to transform.
+        Returns:
+            List of transformed coefficients.
+        """
+        num_coeffs = len(coeffs)
+        result = self.fft(coeffs, rou=self.roots_of_unity_inv)
+        for i in range(num_coeffs):
+            result[i] /= num_coeffs
+        return result
+
+    def check_embedding_input(self, values):
+        """Checks that the length of the input vector to embedding is the correct size.
+        Throws an error if the length of the input vector to embedding is not 1/4 the size
+        of the FFT vector.
+        Args:
+            values (list): Input vector of complex numbers.
+        """
+        assert len(values) <= self.fft_length / 4, "Input vector must have length at most " \
+            + str(self.fft_length / 4) + " < " + str(len(values)) + " = len(values)"
+
+    def embedding(self, coeffs):
+        """Computes a variant of the canonical embedding on the given coefficients.
+        Computes the canonical embedding which consists of evaluating a given polynomial at roots of unity
+        that are indexed 1 (mod 4), w, w^5, w^9, ...
+        The evaluations are returned in the order: w, w^5, w^(5^2), ...
+        Args:
+            coeffs (list): List of complex numbers to transform.
+        Returns:
+            List of transformed coefficients.
+        """
+        self.check_embedding_input(coeffs)
+        num_coeffs = len(coeffs)
+        result = bit_reverse_vec(coeffs)
+        log_num_coeffs = int(log(num_coeffs, 2))
+        for logm in range(1, log_num_coeffs + 1):
+            idx_mod = 1 << (logm + 2)
+            gap = self.fft_length // idx_mod
+            for j in range(0, num_coeffs, (1 << logm)):
+                for i in range(1 << (logm - 1)):
+                    index_even = j + i
+                    index_odd = j + i + (1 << (logm - 1))
